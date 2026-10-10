@@ -1,0 +1,70 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, ARM64]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF#refs/tags/v}"; else v="0.0.0-${GITHUB_SHA::7}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        # No -G: the runner's newest Visual Studio, whichever that is this month. Quoted, or pwsh splits the -D at the dot.
+        run: cmake -S . -B build -A ${{ matrix.arch }} "-DAPP_VERSION=${{ steps.version.outputs.version }}"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # ARM64 binaries cannot run on the x64 runner; the x64 leg runs the suite.
+      - name: Test
+        if: matrix.arch == 'x64'
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Smoke-run the CLI
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          build\Release\claude-usage.exe version
+          build\Release\ClaudeUsage.exe version | Out-Host
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "claude-usage-win-${{ steps.version.outputs.version }}-${{ matrix.arch }}"
+          New-Item -ItemType Directory $out | Out-Null
+          Copy-Item build\Release\ClaudeUsage.exe, build\Release\claude-usage.exe, README.md, LICENSE $out
+          Compress-Archive -Path $out\* -DestinationPath "$out.zip"
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-usage-win-${{ matrix.arch }}
+          path: claude-usage-win-*.zip
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "Claude Usage for Windows $GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" claude-usage-win-*.zip --clobber
